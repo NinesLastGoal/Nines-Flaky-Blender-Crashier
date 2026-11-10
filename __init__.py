@@ -41,6 +41,7 @@ import importlib
 import subprocess
 import bpy.utils.previews
 
+
 libs_path = os.path.join(os.path.dirname(__file__), 'deps')
 scheme = sysconfig.get_preferred_scheme("user")
 user_site = sysconfig.get_paths(scheme, vars={"userbase": libs_path})["purelib"]
@@ -65,6 +66,7 @@ if not missing_deps:
     import igl
     from .weighttransfer import find_matches_closest_surface, inpaint, limit_mask, smooth_weigths
     from . import util
+    from .voxel_pass import geodesic_voxel_transfer
 
 
 class RobustWeightTransfer(bpy.types.Operator):
@@ -72,8 +74,29 @@ class RobustWeightTransfer(bpy.types.Operator):
     bl_idname = "object.skin_weight_transfer"
     bl_label = "Robust Weight Transfer"
     bl_options = {'REGISTER', 'UNDO'}
-    
+        # Geodesic Voxel Pass
+    voxel_resolution: bpy.props.IntProperty(
+        name="Voxel Resolution",
+        description="Grid resolution for volumetric pass (higher = finer but slower)",
+        default=64, min=16, max=128
+    )
+    voxel_diffusion_steps: bpy.props.IntProperty(
+        name="Diffusion Steps",
+        description="How far weights can flow through the volume",
+        default=8, min=1, max=32
+    )
+    voxel_falloff: bpy.props.FloatProperty(
+        name="Falloff",
+        description="Softens long-range influence (1.0 = none)",
+        default=1.0, min=0.1, max=2.0
+    )
+    voxel_mix: bpy.props.FloatProperty(
+        name="Mix Factor",
+        description="1.0 = replace, lower = blend with existing",
+        default=1.0, min=0.0, max=1.0
+    )
     @classmethod
+    
     def poll(cls, context: bpy.types.Context) -> bool:
         if context.mode != 'OBJECT' and context.mode != 'PAINT_WEIGHT': return False
         
@@ -128,6 +151,7 @@ class RobustWeightTransfer(bpy.types.Operator):
         deform_only = scene_settings.group_selection == 'DEFORM_POSE_BONES'
         is_deform = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_obj.vertex_groups]
         source_weights = util.get_groups_arr(source_obj, is_deform if deform_only else None) # (num_verts, )
+        
         for obj in target_objs:
             object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
             verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
@@ -216,7 +240,83 @@ class RobustWeightTransfer(bpy.types.Operator):
             self.report({'INFO'}, f'Weights transfered from {source_obj.name} to {context.object.name}')
         return {'FINISHED'}
     
+class GeodesicVoxelPass(bpy.types.Operator):
+    """Run volumetric geodesic-style weight pass (flows through volume / gaps)"""
+    bl_idname = "object.rwt_geodesic_voxel_pass"
+    bl_label = "Geodesic Voxel Pass"
+    bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        # Reuse the same poll logic as the main transfer
+        return RobustWeightTransfer.poll(context)
+
+    def execute(self, context):
+        scene_settings = context.scene.robust_weight_transfer_settings
+        source_obj = scene_settings.source_object
+        if source_obj.type != 'MESH':
+            self.report({'ERROR'}, "Source is not a mesh")
+            return {'CANCELLED'}
+
+        if scene_settings.apply_to_selected:
+            target_objs = [o for o in context.selected_objects if o != source_obj and isinstance(o.data, bpy.types.Mesh)]
+        else:
+            target_objs = [context.object] if context.object and context.object != source_obj else []
+
+        if not target_objs:
+            self.report({'ERROR'}, "No valid target meshes")
+            return {'CANCELLED'}
+
+        depsgraph = context.evaluated_depsgraph_get()
+        src_eval = source_obj.evaluated_get(depsgraph) if scene_settings.use_deformed_source else source_obj
+        source_verts, _, _ = util.get_obj_arrs_world(src_eval)
+
+        deform_only = scene_settings.group_selection == 'DEFORM_POSE_BONES'
+        is_deform = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_obj.vertex_groups]
+        source_weights = util.get_groups_arr(source_obj, is_deform if deform_only else None)
+
+        for obj in target_objs:
+            tgt_eval = obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj
+            target_verts, _, _ = util.get_obj_arrs_world(tgt_eval)
+
+            new_weights = geodesic_voxel_transfer(
+                source_verts,
+                source_weights,
+                target_verts,
+                resolution=scene_settings.voxel_resolution,
+                diffusion_steps=scene_settings.voxel_diffusion_steps,
+                falloff=scene_settings.voxel_falloff,
+                mix_factor=scene_settings.voxel_mix,
+            )
+
+            # Write using the same pattern as the main operator
+            source_vertex_groups = source_obj.vertex_groups
+            weight_counts = np.count_nonzero(new_weights, axis=0)
+            for group, w_count in zip(source_vertex_groups, weight_counts):
+                if w_count > 0 and group.name not in obj.vertex_groups:
+                    obj.vertex_groups.new(name=group.name)
+
+            is_deform_list = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_vertex_groups]
+
+            for i, w in enumerate(new_weights.T):
+                if weight_counts[i] == 0:
+                    continue
+                source_group = source_vertex_groups[i]
+                target_group = obj.vertex_groups[source_group.name]
+                if target_group.lock_weight:
+                    continue
+                if deform_only and not is_deform_list[i]:
+                    continue
+
+                for j, wv in enumerate(w):
+                    if wv >= 0.00001:
+                        target_group.add([j], float(wv), 'REPLACE')
+                ind = np.where(w < 0.00001)[0].tolist()
+                if ind:
+                    target_group.remove(ind)
+
+        self.report({'INFO'}, f"Geodesic voxel pass finished on {len(target_objs)} object(s)")
+        return {'FINISHED'}
 class SelectNonMatched(bpy.types.Operator):
     """Select Rejected Loose Parts"""
     bl_idname = "object.select_non_matched"
